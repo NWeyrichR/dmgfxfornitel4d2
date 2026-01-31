@@ -38,6 +38,7 @@ float g_fDeathBlockUntil[2048];
 int g_iTankHP[MAXPLAYERS+1];
 int g_iTankRef[MAXPLAYERS+1];
 char g_sSpritePath[] = "materials/dmgfx/numbers.vmt"; 
+bool g_bTakeDamageHooked[MAXPLAYERS + 1];
 
 public void OnPluginStart() {
     g_cvScale = CreateConVar("sm_damage_scale", "0.08", "Escala base");
@@ -51,6 +52,11 @@ public void OnPluginStart() {
     HookEvent("infected_hurt", Event_Damage);
     HookEvent("player_death", Event_PlayerDeath);
     HookEvent("player_spawn", Event_PlayerSpawn);
+
+    for (int i = 1; i <= MaxClients; i++) {
+        if (!IsClientInGame(i)) continue;
+        EnsureTakeDamageHook(i);
+    }
 }
 
 public void OnMapStart() { 
@@ -186,7 +192,7 @@ public Action Timer_Collect(Handle timer, DataPack pack) {
     int victim = pack.ReadCell();
     // REMOVIDO: delete pack; (O CreateDataTimer já faz isso)
 
-    if (attacker > 0 && IsValidEntity(victim)) {
+    if (attacker > 0 && IsValidEntity(victim) && !IsDeathAnimBlocked(victim) && !IsVictimDyingOrDead(victim)) {
         SpawnEverything(attacker, g_iShotgunSum[attacker], victim, g_bShotgunCrit[attacker], true);
         
         g_iShotgunSum[attacker] = 0;
@@ -202,7 +208,9 @@ public Action Timer_CollectShotgun(Handle timer, DataPack pack) {
     // REMOVIDO: delete pack; (O CreateDataTimer já faz isso)
 
     if (attacker > 0 && IsClientInGame(attacker)) {
-        SpawnEverything(attacker, g_iShotgunSum[attacker], victim, g_bShotgunCrit[attacker], true);
+        if (!IsDeathAnimBlocked(victim) && !IsVictimDyingOrDead(victim)) {
+            SpawnEverything(attacker, g_iShotgunSum[attacker], victim, g_bShotgunCrit[attacker], true);
+        }
         
         g_iShotgunSum[attacker] = 0;
         g_bShotgunActive[attacker] = false;
@@ -482,3 +490,50 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
 }
 
 public bool Filter_World(int entity, int mask) { return (entity == 0); }
+
+public void OnClientPutInServer(int client)
+{
+    if (client <= 0 || client > MaxClients) return;
+    g_bTakeDamageHooked[client] = false;
+    EnsureTakeDamageHook(client);
+}
+
+public void OnClientDisconnect(int client)
+{
+    if (client <= 0 || client > MaxClients) return;
+    g_bTakeDamageHooked[client] = false;
+}
+
+void EnsureTakeDamageHook(int client)
+{
+    if (client <= 0 || client > MaxClients) return;
+    if (!IsClientInGame(client)) return;
+    if (g_bTakeDamageHooked[client]) return;
+
+    SDKHook(client, SDKHook_OnTakeDamage, OnTakeDamage_BlockTankLethal);
+    g_bTakeDamageHooked[client] = true;
+}
+
+public Action OnTakeDamage_BlockTankLethal(int victim, int &attacker, int &inflictor, float &damage, int &damagetype)
+{
+    if (victim <= 0 || victim > MaxClients) return Plugin_Continue;
+    if (!IsClientInGame(victim)) return Plugin_Continue;
+    if (!IsClientTank(victim)) return Plugin_Continue;
+    if (IsDeathAnimBlocked(victim)) return Plugin_Continue;
+
+    if (attacker <= 0 || attacker > MaxClients) return Plugin_Continue;
+    if (!IsClientInGame(attacker) || IsFakeClient(attacker)) return Plugin_Continue;
+    if (GetClientTeam(attacker) != 2) return Plugin_Continue;
+
+    int hp = GetClientHealth(victim);
+    if (hp <= 0) return Plugin_Continue;
+
+    int dmg = RoundToCeil(damage);
+    if (dmg <= 0) return Plugin_Continue;
+
+    if (dmg >= hp) {
+        BlockDeathAnim(victim, 15.0);
+    }
+
+    return Plugin_Continue;
+}
