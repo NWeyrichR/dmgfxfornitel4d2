@@ -22,6 +22,7 @@ int ge_iOwner[2048];
 bool g_bState[MAXPLAYERS+1]; 
 Handle g_hCookie;
 bool g_bSlotForceFade[MAXPLAYERS + 1][5]; 
+int g_iSlotGen[MAXPLAYERS + 1][5];
 
 int g_iNextSlot[MAXPLAYERS+1];
 int g_iShotgunSum[MAXPLAYERS+1];
@@ -29,12 +30,16 @@ bool g_bShotgunActive[MAXPLAYERS+1];
 bool g_bShotgunCrit[MAXPLAYERS+1];
 float g_vShotgunPos[MAXPLAYERS+1][3]; // Salva onde o primeiro balim pegou
 
-ConVar g_cvScale, g_cvSpacing;
+ConVar g_cvScale, g_cvSpacing, g_cvRate, g_cvBurst;
+float g_fTokens[MAXPLAYERS+1];
+float g_fLastTokenUpdate[MAXPLAYERS+1];
 char g_sSpritePath[] = "materials/dmgfx/numbers.vmt"; 
 
 public void OnPluginStart() {
     g_cvScale = CreateConVar("sm_damage_scale", "0.08", "Escala base");
     g_cvSpacing = CreateConVar("sm_damage_spacing", "7.0", "Distancia");
+    g_cvRate = CreateConVar("sm_damage_rate", "40.0", "Limite de numeros por segundo (por jogador). 0 = desativado");
+    g_cvBurst = CreateConVar("sm_damage_burst", "20.0", "Burst maximo de numeros (por jogador).");
     RegConsoleCmd("sm_hits", Command_ToggleHits);
     g_hCookie = RegClientCookie("fortnite_hits_state", "Estado", CookieAccess_Protected);
     HookEvent("player_hurt", Event_Damage);
@@ -68,6 +73,47 @@ public Action OnTransmit(int entity, int client) {
         return Plugin_Stop; 
     }
     return Plugin_Continue;
+}
+
+bool IsVictimDyingOrDead(int victim)
+{
+    if (victim <= 0 || victim >= 2048 || !IsValidEntity(victim)) return true;
+
+    int lifeState = 0;
+    if (HasEntProp(victim, Prop_Data, "m_lifeState"))
+        lifeState = GetEntProp(victim, Prop_Data, "m_lifeState");
+    else if (victim <= MaxClients)
+        return !IsPlayerAlive(victim);
+
+    if (lifeState != 0) return true;
+
+    if (HasEntProp(victim, Prop_Data, "m_iHealth"))
+        return (GetEntProp(victim, Prop_Data, "m_iHealth") <= 0);
+
+    return false;
+}
+
+bool ConsumeTokens(int attacker, int cost)
+{
+    if (attacker <= 0 || attacker > MaxClients) return false;
+
+    float rate = g_cvRate.FloatValue;
+    float burst = g_cvBurst.FloatValue;
+    if (rate <= 0.0 || burst <= 0.0) return true; // desativado
+
+    float now = GetGameTime();
+    float dt = now - g_fLastTokenUpdate[attacker];
+    if (dt < 0.0) dt = 0.0;
+
+    g_fTokens[attacker] += dt * rate;
+    if (g_fTokens[attacker] > burst) g_fTokens[attacker] = burst;
+    g_fLastTokenUpdate[attacker] = now;
+
+    float fCost = float(cost);
+    if (g_fTokens[attacker] < fCost) return false;
+
+    g_fTokens[attacker] -= fCost;
+    return true;
 }
 
 public Action Timer_Collect(Handle timer, DataPack pack) {
@@ -111,12 +157,16 @@ public void Frame_MasterLogic(DataPack pack) {
     float p[3]; p[0] = pack.ReadFloat(); p[1] = pack.ReadFloat(); p[2] = pack.ReadFloat();
     float hVel = pack.ReadFloat(); float vVel = pack.ReadFloat();
     int slot = pack.ReadCell();
+    int gen = pack.ReadCell();
 
     // Ler os sprites para um array local antes de resetar o pack para escrita
     int sprites[16];
     for (int i = 0; i < len; i++) sprites[i] = pack.ReadCell();
 
-    if (attacker <= 0 || !IsClientInGame(attacker) || alpha <= 10) {
+    bool killNow = (attacker <= 0 || !IsClientInGame(attacker) || alpha <= 10);
+    if (!killNow && slot >= 0 && slot < 5 && g_iSlotGen[attacker][slot] != gen) killNow = true;
+
+    if (killNow) {
         for (int i = 0; i < len; i++) {
             int ent = EntRefToEntIndex(sprites[i]);
             if (ent > MaxClients && IsValidEntity(ent)) AcceptEntityInput(ent, "Kill");
@@ -142,6 +192,7 @@ public void Frame_MasterLogic(DataPack pack) {
     pack.WriteFloat(p[0]); pack.WriteFloat(p[1]); pack.WriteFloat(p[2]);
     pack.WriteFloat(hVel); pack.WriteFloat(vVel);
     pack.WriteCell(slot);
+    pack.WriteCell(gen);
     for (int i = 0; i < len; i++) pack.WriteCell(sprites[i]);
 
     float split = (ticks > 25) ? (float(ticks - 25) * 1.5) : 0.0;
@@ -181,6 +232,10 @@ void SpawnEverything(int attacker, int damage, int victim, bool crit, bool isSho
     float vPos[3]; // USANDO: Variável de posição
     
     // USANDO: isShotgun e victim para definir onde o número nasce
+    // Limite para evitar crash em spam (molotov, hordas, etc.)
+    if (len <= 0 || len > sizeof(sDmg) - 1) return;
+    if (!ConsumeTokens(attacker, len)) return;
+
     if (isShotgun) {
         vPos[0] = g_vShotgunPos[attacker][0];
         vPos[1] = g_vShotgunPos[attacker][1];
@@ -210,7 +265,10 @@ void SpawnEverything(int attacker, int damage, int victim, bool crit, bool isSho
     pack.WriteFloat(10.0); // vVel
     
     int slot = g_iNextSlot[attacker];
+    g_iNextSlot[attacker] = (slot + 1) % 5;
+    int gen = ++g_iSlotGen[attacker][slot];
     pack.WriteCell(slot);
+    pack.WriteCell(gen);
     g_bSlotForceFade[attacker][slot] = false;
 
     for (int i = 0; i < len; i++) {
@@ -229,7 +287,6 @@ void SpawnEverything(int attacker, int damage, int victim, bool crit, bool isSho
         pack.WriteCell(EntIndexToEntRef(sprite));
     }
     
-    g_iNextSlot[attacker] = (slot + 1) % 5;
     RequestFrame(Frame_MasterLogic, pack);
 }
 
@@ -238,6 +295,8 @@ public void Event_Damage(Event event, const char[] name, bool dontBroadcast) {
     int victim = (StrEqual(name, "player_hurt")) ? GetClientOfUserId(event.GetInt("userid")) : event.GetInt("entityid");
 
     if (attacker <= 0 || attacker > MaxClients || !IsClientInGame(attacker) || IsFakeClient(attacker) || attacker == victim || !g_bState[attacker]) 
+        return;
+    if (victim > 0 && IsValidEntity(victim) && IsVictimDyingOrDead(victim))
         return;
 
     int damage = event.GetInt("amount"); 
