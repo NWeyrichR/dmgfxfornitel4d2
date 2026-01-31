@@ -10,7 +10,7 @@ public Plugin myinfo = {
     name = "L4D2 Fortnite Damage (Dmgfx Fix - Part 1)",
     author = "AI Assistant",
     description = "Soma shotgun, Diretorio dmgfx, Limite 5 e Spawn",
-    version = "54.0"
+    version = "55.3"
 }
 
 
@@ -30,9 +30,13 @@ bool g_bShotgunActive[MAXPLAYERS+1];
 bool g_bShotgunCrit[MAXPLAYERS+1];
 float g_vShotgunPos[MAXPLAYERS+1][3]; // Salva onde o primeiro balim pegou
 
-ConVar g_cvScale, g_cvSpacing, g_cvRate, g_cvBurst;
+ConVar g_cvScale, g_cvSpacing, g_cvRate, g_cvBurst, g_cvMaxScale;
 float g_fTokens[MAXPLAYERS+1];
 float g_fLastTokenUpdate[MAXPLAYERS+1];
+int g_iDeathBlockRef[2048];
+float g_fDeathBlockUntil[2048];
+int g_iTankHP[MAXPLAYERS+1];
+int g_iTankRef[MAXPLAYERS+1];
 char g_sSpritePath[] = "materials/dmgfx/numbers.vmt"; 
 
 public void OnPluginStart() {
@@ -40,10 +44,13 @@ public void OnPluginStart() {
     g_cvSpacing = CreateConVar("sm_damage_spacing", "7.0", "Distancia");
     g_cvRate = CreateConVar("sm_damage_rate", "40.0", "Limite de numeros por segundo (por jogador). 0 = desativado");
     g_cvBurst = CreateConVar("sm_damage_burst", "20.0", "Burst maximo de numeros (por jogador).");
+    g_cvMaxScale = CreateConVar("sm_damage_max_scale", "0.12", "Escala maxima do numero (cap) para distancias longas. 0 = sem limite");
     RegConsoleCmd("sm_hits", Command_ToggleHits);
     g_hCookie = RegClientCookie("fortnite_hits_state", "Estado", CookieAccess_Protected);
     HookEvent("player_hurt", Event_Damage);
     HookEvent("infected_hurt", Event_Damage);
+    HookEvent("player_death", Event_PlayerDeath);
+    HookEvent("player_spawn", Event_PlayerSpawn);
 }
 
 public void OnMapStart() { 
@@ -80,16 +87,73 @@ bool IsVictimDyingOrDead(int victim)
     if (victim <= 0 || victim >= 2048 || !IsValidEntity(victim)) return true;
 
     int lifeState = 0;
-    if (HasEntProp(victim, Prop_Data, "m_lifeState"))
+    if (HasEntProp(victim, Prop_Send, "m_lifeState"))
+        lifeState = GetEntProp(victim, Prop_Send, "m_lifeState");
+    else if (HasEntProp(victim, Prop_Data, "m_lifeState"))
         lifeState = GetEntProp(victim, Prop_Data, "m_lifeState");
     else if (victim <= MaxClients)
         return !IsPlayerAlive(victim);
 
     if (lifeState != 0) return true;
 
-    if (HasEntProp(victim, Prop_Data, "m_iHealth"))
-        return (GetEntProp(victim, Prop_Data, "m_iHealth") <= 0);
+    int health = 0;
+    if (HasEntProp(victim, Prop_Send, "m_iHealth"))
+        health = GetEntProp(victim, Prop_Send, "m_iHealth");
+    else if (HasEntProp(victim, Prop_Data, "m_iHealth"))
+        health = GetEntProp(victim, Prop_Data, "m_iHealth");
+    else
+        return false;
 
+    return (health <= 0);
+}
+
+bool IsDeathAnimBlocked(int victim)
+{
+    if (victim <= 0 || victim >= 2048 || !IsValidEntity(victim)) return false;
+    if (g_iDeathBlockRef[victim] == 0) return false;
+    if (EntIndexToEntRef(victim) != g_iDeathBlockRef[victim]) return false;
+    return (GetGameTime() < g_fDeathBlockUntil[victim]);
+}
+
+void BlockDeathAnim(int victim, float duration)
+{
+    if (victim <= 0 || victim > MaxClients || !IsClientInGame(victim)) return;
+    g_iDeathBlockRef[victim] = EntIndexToEntRef(victim);
+    g_fDeathBlockUntil[victim] = GetGameTime() + duration;
+}
+
+bool IsClientTank(int client)
+{
+    if (client <= 0 || client > MaxClients || !IsClientInGame(client)) return false;
+    if (GetClientTeam(client) != 3) return false;
+    if (!HasEntProp(client, Prop_Send, "m_zombieClass")) return false;
+    return (GetEntProp(client, Prop_Send, "m_zombieClass") == 8);
+}
+
+bool ShouldBlockTankDeathFromHurt(Event event, int victim)
+{
+    if (!IsClientTank(victim)) return false;
+
+    int damage = event.GetInt("dmg_health");
+    if (damage <= 0) damage = event.GetInt("amount");
+    if (damage <= 0) return false;
+
+    int eventHP = event.GetInt("health");
+    if (eventHP < 0) eventHP = 0;
+
+    int ref = EntIndexToEntRef(victim);
+    if (g_iTankRef[victim] != ref) {
+        g_iTankRef[victim] = ref;
+        g_iTankHP[victim] = eventHP + damage;
+    }
+
+    g_iTankHP[victim] -= damage;
+    if (eventHP > 0 && eventHP < g_iTankHP[victim]) g_iTankHP[victim] = eventHP;
+
+    if (g_iTankHP[victim] <= 0) {
+        BlockDeathAnim(victim, 15.0);
+        return true;
+    }
     return false;
 }
 
@@ -205,16 +269,44 @@ public void Frame_MasterLogic(DataPack pack) {
         float dPos[3];
         dPos[0] = p[0] + (vRight[0] * offset); dPos[1] = p[1] + (vRight[1] * offset); dPos[2] = p[2];
 
-        float lookAng[3], lookVec[3];
+        float lookVec[3];
         MakeVectorFromPoints(dPos, vEyePos, lookVec);
-        GetVectorAngles(lookVec, lookAng);
-        lookAng[0] *= -1.0; lookAng[1] += 180.0;
+
+        // Angulo mais estavel (evita flip quando o player esta muito acima/abaixo)
+        float fullAng[3];
+        GetVectorAngles(lookVec, fullAng);
+        fullAng[0] *= -1.0;
+
+        float yawVec[3];
+        yawVec[0] = lookVec[0];
+        yawVec[1] = lookVec[1];
+        yawVec[2] = 0.0;
+
+        float yawAng[3];
+        float horiz = SquareRoot(yawVec[0] * yawVec[0] + yawVec[1] * yawVec[1]);
+        float yaw = 0.0;
+        if (horiz < 0.001) yaw = vEyeAng[1] + 180.0;
+        else {
+            GetVectorAngles(yawVec, yawAng);
+            yaw = yawAng[1] + 180.0;
+        }
+
+        float pitch = fullAng[0];
+        if (pitch > 80.0) pitch = 80.0;
+        else if (pitch < -80.0) pitch = -80.0;
+
+        float lookAng[3];
+        lookAng[0] = pitch;
+        lookAng[1] = yaw;
+        lookAng[2] = 0.0;
 
         TeleportEntity(sprite, dPos, lookAng, NULL_VECTOR);
         
         // Escala Baseada na Distancia
         float dist = GetVectorDistance(vEyePos, dPos);
         float dynamicScale = (dist / 450.0) * g_cvScale.FloatValue;
+        float maxScale = g_cvMaxScale.FloatValue;
+        if (maxScale > 0.0 && dynamicScale > maxScale) dynamicScale = maxScale;
         if (ticks <= 6) dynamicScale *= (0.5 + (float(ticks) * 0.15));
         
         SetVariantFloat(dynamicScale); AcceptEntityInput(sprite, "SetScale");
@@ -235,6 +327,12 @@ void SpawnEverything(int attacker, int damage, int victim, bool crit, bool isSho
     // Limite para evitar crash em spam (molotov, hordas, etc.)
     if (len <= 0 || len > sizeof(sDmg) - 1) return;
     if (!ConsumeTokens(attacker, len)) return;
+
+    // Evita spam/bug durante animacao de morte (ex: Tank queimando e "chovendo 1")
+    if (victim > 0 && victim <= MaxClients) {
+        if (!IsClientInGame(victim)) return;
+        if (IsDeathAnimBlocked(victim) || IsVictimDyingOrDead(victim)) return;
+    }
 
     if (isShotgun) {
         vPos[0] = g_vShotgunPos[attacker][0];
@@ -296,6 +394,22 @@ public void Event_Damage(Event event, const char[] name, bool dontBroadcast) {
 
     if (attacker <= 0 || attacker > MaxClients || !IsClientInGame(attacker) || IsFakeClient(attacker) || attacker == victim || !g_bState[attacker]) 
         return;
+
+    // Tank/SI: detecta o frame exato que a vida chega a 0 (player_death pode vir so depois da animacao)
+    if (StrEqual(name, "player_hurt")) {
+        int remainingHP = event.GetInt("health");
+        if (victim > 0 && victim <= MaxClients && remainingHP <= 0) {
+            BlockDeathAnim(victim, 15.0);
+            return;
+        }
+
+        // Tank: se o "health" do evento vier bugado, usa tracking por dano para cortar no 0.
+        if (victim > 0 && victim <= MaxClients && ShouldBlockTankDeathFromHurt(event, victim)) {
+            return;
+        }
+    }
+
+    if (IsDeathAnimBlocked(victim)) return;
     if (victim > 0 && IsValidEntity(victim) && IsVictimDyingOrDead(victim))
         return;
 
@@ -306,8 +420,11 @@ public void Event_Damage(Event event, const char[] name, bool dontBroadcast) {
     char weapon[32]; 
     event.GetString("weapon", weapon, sizeof(weapon));
 
+    int dmgType = event.GetInt("type");
+    bool bulletLike = (dmgType == 0) || ((dmgType & (DMG_BULLET | DMG_BUCKSHOT)) != 0);
+
     // Se o nome da arma vier vazio (comum em Witch/Infected), pegamos a arma ativa do jogador
-    if (weapon[0] == '\0') {
+    if (weapon[0] == '\0' && bulletLike) {
         int iWep = GetEntPropEnt(attacker, Prop_Send, "m_hActiveWeapon");
         if (iWep > 0 && IsValidEntity(iWep)) {
             GetEntityClassname(iWep, weapon, sizeof(weapon));
@@ -316,6 +433,7 @@ public void Event_Damage(Event event, const char[] name, bool dontBroadcast) {
 
     // Verifica se é shotgun (agora detecta chrome, spas, pump e auto)
     bool isShotgun = (StrContains(weapon, "shotgun") != -1 || StrContains(weapon, "spas") != -1);
+    if (dmgType != 0) isShotgun = (isShotgun && ((dmgType & (DMG_BULLET | DMG_BUCKSHOT)) != 0));
 
     if (isShotgun) {
         if (!g_bShotgunActive[attacker]) {
@@ -339,6 +457,27 @@ public void Event_Damage(Event event, const char[] name, bool dontBroadcast) {
         }
     } else {
         SpawnEverything(attacker, damage, victim, (event.GetInt("hitgroup") == 1), false);
+    }
+}
+
+public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)
+{
+    int victim = GetClientOfUserId(event.GetInt("userid"));
+    if (victim <= 0 || victim >= 2048 || !IsValidEntity(victim)) return;
+
+    // Bloqueia o spam de dano durante animacao de morte (ex: Tank queimando e "chovendo 1")
+    BlockDeathAnim(victim, 15.0);
+}
+
+public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast)
+{
+    int client = GetClientOfUserId(event.GetInt("userid"));
+    if (client <= 0 || client >= 2048) return;
+    g_iDeathBlockRef[client] = 0;
+    g_fDeathBlockUntil[client] = 0.0;
+    if (client <= MaxClients) {
+        g_iTankRef[client] = 0;
+        g_iTankHP[client] = 0;
     }
 }
 
